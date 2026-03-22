@@ -15,6 +15,16 @@ _DEFAULTS = {
     "cross_compile": "",
     "arch": "arm",
     "defconfig": "mocha_android_defconfig",
+    "ramdisk": "",
+    "dtb_name": "tegra124-mocha.dtb",
+    "boot_img_params": {
+        "base": "0x10000000",
+        "kernel_offset": "0x00008000",
+        "ramdisk_offset": "0x02000000",
+        "tags_offset": "0x00000100",
+        "pagesize": "2048",
+        "cmdline": "vpr_resize androidboot.selinux=permissive buildvariant=userdebug",
+    },
 }
 
 
@@ -24,6 +34,13 @@ class Config:
     cross_compile: str = ""
     arch: str = "arm"
     defconfig: str = "mocha_android_defconfig"
+    ramdisk: str = ""
+    dtb_name: str = "tegra124-mocha.dtb"
+    boot_img_params: dict = None
+
+    def __post_init__(self):
+        if self.boot_img_params is None:
+            self.boot_img_params = dict(_DEFAULTS["boot_img_params"])
 
     def is_configured(self) -> bool:
         return bool(self.kernel_dir and self.cross_compile)

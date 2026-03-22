@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import asdict
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 from . import builder, config
 
@@ -60,6 +60,8 @@ async def set_config(
     cross_compile: str | None = None,
     arch: str | None = None,
     defconfig: str | None = None,
+    ramdisk: str | None = None,
+    dtb_name: str | None = None,
 ) -> str:
     """Update server configuration. Only provided fields are changed.
 
@@ -68,12 +70,16 @@ async def set_config(
         cross_compile: Full path to cross-compiler prefix (e.g. /opt/toolchain/bin/arm-linux-gnueabihf-)
         arch: Target architecture (default: arm)
         defconfig: Default defconfig name (default: mocha_android_defconfig)
+        ramdisk: Path to ramdisk.img for boot.img assembly
+        dtb_name: DTB filename (default: tegra124-mocha.dtb)
     """
     changes = {
         "kernel_dir": kernel_dir,
         "cross_compile": cross_compile,
         "arch": arch,
         "defconfig": defconfig,
+        "ramdisk": ramdisk,
+        "dtb_name": dtb_name,
     }
     cfg = config.update(changes)
     errors = cfg.validate()
@@ -116,26 +122,36 @@ async def git_reset(branch: str | None = None) -> str:
 
 
 @mcp.tool()
-async def build(target: str = "zImage modules") -> str:
+async def build(target: str = "zImage modules", ctx: Context = None) -> str:
     """Run kernel build. Output is saved to build log.
 
     Args:
         target: Make target(s) (default: "zImage modules")
     """
     cfg = _require_config()
-    result = await builder.build(cfg, target)
+
+    async def on_line(line: str) -> None:
+        if ctx:
+            await ctx.info(line)
+
+    result = await builder.build(cfg, target, on_line=on_line)
     return _format_result(result)
 
 
 @mcp.tool()
-async def build_module(path: str) -> str:
+async def build_module(path: str, ctx: Context = None) -> str:
     """Build a specific kernel module directory.
 
     Args:
         path: Path relative to kernel root (e.g. "drivers/media/platform/tegra/")
     """
     cfg = _require_config()
-    result = await builder.build_module(cfg, path)
+
+    async def on_line(line: str) -> None:
+        if ctx:
+            await ctx.info(line)
+
+    result = await builder.build_module(cfg, path, on_line=on_line)
     return _format_result(result)
 
 
@@ -160,6 +176,20 @@ async def clean(full: bool = False) -> str:
     """
     cfg = _require_config()
     result = await builder.clean(cfg, full)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def build_boot_img() -> str:
+    """Build boot.img from zImage + DTB + ramdisk.
+
+    Requires ramdisk path to be set in config. Uses zImage and DTB
+    from the last kernel build. Output: boot.img in kernel dir root.
+    """
+    cfg = _require_config()
+    if not cfg.ramdisk:
+        return "Error: ramdisk path not set. Use set_config(ramdisk='/path/to/ramdisk.img')"
+    result = await builder.build_boot_img(cfg)
     return _format_result(result)
 
 

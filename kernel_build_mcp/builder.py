@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -9,6 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Awaitable
 
 from .config import Config
 
@@ -26,9 +28,7 @@ class RunResult:
 
 
 async def run(cmd: list[str], cwd: str, log_path: str | None = None) -> RunResult:
-    """Run a subprocess, capture output. Single entry point for all execution."""
-    import asyncio
-
+    """Run a subprocess, capture output."""
     expanded_cwd = str(Path(cwd).expanduser())
     logger.info("Running: %s in %s", " ".join(cmd), expanded_cwd)
 
@@ -46,8 +46,58 @@ async def run(cmd: list[str], cwd: str, log_path: str | None = None) -> RunResul
     stderr = stderr_bytes.decode("utf-8", errors="replace")
 
     if log_path:
-        combined = stdout + stderr
-        Path(log_path).write_text(combined)
+        Path(log_path).write_text(stdout + stderr)
+
+    return RunResult(
+        exit_code=proc.returncode or 0,
+        stdout=stdout,
+        stderr=stderr,
+        duration_s=round(duration, 2),
+    )
+
+
+async def run_streaming(
+    cmd: list[str],
+    cwd: str,
+    on_line: Callable[[str], Awaitable[None]],
+    log_path: str | None = None,
+) -> RunResult:
+    """Run a subprocess, stream each line via callback, capture full output."""
+    expanded_cwd = str(Path(cwd).expanduser())
+    logger.info("Running (streaming): %s in %s", " ".join(cmd), expanded_cwd)
+
+    start = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=expanded_cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    async def read_stream(stream: asyncio.StreamReader, lines: list[str], is_stderr: bool = False):
+        while True:
+            line_bytes = await stream.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
+            lines.append(line)
+            await on_line(line)
+
+    await asyncio.gather(
+        read_stream(proc.stdout, stdout_lines),
+        read_stream(proc.stderr, stderr_lines, is_stderr=True),
+    )
+    await proc.wait()
+    duration = time.monotonic() - start
+
+    stdout = "\n".join(stdout_lines)
+    stderr = "\n".join(stderr_lines)
+
+    if log_path:
+        Path(log_path).write_text(stdout + "\n" + stderr)
 
     return RunResult(
         exit_code=proc.returncode or 0,
@@ -68,7 +118,7 @@ def make_cmd(config: Config, target: str, extra_args: list[str] | None = None) -
     ]
     if extra_args:
         cmd.extend(extra_args)
-    cmd.append(target)
+    cmd.extend(target.split())
     return cmd
 
 
@@ -78,7 +128,6 @@ def make_cmd(config: Config, target: str, extra_args: list[str] | None = None) -
 async def git_pull(config: Config, branch: str | None = None) -> RunResult:
     """Fetch and pull. Optionally switch branch first."""
     cwd = config.kernel_dir
-    # Always fetch first
     fetch = await run(["git", "fetch", "--all"], cwd)
     if fetch.exit_code != 0:
         return fetch
@@ -103,21 +152,24 @@ async def git_reset(config: Config, branch: str | None = None) -> RunResult:
         if checkout.exit_code != 0:
             return checkout
 
-    # Determine current branch for reset target
     current = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
     branch_name = current.stdout.strip()
     return await run(["git", "reset", "--hard", f"origin/{branch_name}"], cwd)
 
 
-async def build(config: Config, target: str = "zImage modules") -> RunResult:
+async def build(config: Config, target: str = "zImage modules", on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
     """Full kernel build."""
     cmd = make_cmd(config, target)
+    if on_line:
+        return await run_streaming(cmd, config.kernel_dir, on_line, log_path=BUILD_LOG)
     return await run(cmd, config.kernel_dir, log_path=BUILD_LOG)
 
 
-async def build_module(config: Config, path: str) -> RunResult:
+async def build_module(config: Config, path: str, on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
     """Build a specific module directory."""
     cmd = make_cmd(config, "modules", extra_args=[f"M={path}"])
+    if on_line:
+        return await run_streaming(cmd, config.kernel_dir, on_line, log_path=BUILD_LOG)
     return await run(cmd, config.kernel_dir, log_path=BUILD_LOG)
 
 
@@ -138,6 +190,46 @@ async def clean(config: Config, full: bool = False) -> RunResult:
 async def run_command(config: Config, command: str) -> RunResult:
     """Run an arbitrary shell command in kernel dir."""
     return await run(["bash", "-c", command], config.kernel_dir)
+
+
+async def build_boot_img(config: Config) -> RunResult:
+    """Build boot.img from zImage + DTB + ramdisk."""
+    kdir = Path(config.kernel_dir).expanduser()
+    zimage = kdir / "arch" / config.arch / "boot" / "zImage"
+    dtb = kdir / "arch" / config.arch / "boot" / "dts" / config.dtb_name
+    ramdisk = Path(config.ramdisk).expanduser()
+    output = kdir / "boot.img"
+
+    if not zimage.exists():
+        return RunResult(1, "", f"zImage not found: {zimage}", 0)
+    if not dtb.exists():
+        return RunResult(1, "", f"DTB not found: {dtb}", 0)
+    if not ramdisk.exists():
+        return RunResult(1, "", f"ramdisk not found: {ramdisk}", 0)
+
+    p = config.boot_img_params
+    server_dir = Path(__file__).resolve().parent.parent
+    mkbootimg_path = server_dir / "mkbootimg"
+    if not mkbootimg_path.exists():
+        return RunResult(1, "", f"mkbootimg not found at {mkbootimg_path}", 0)
+    cmd = [
+        str(mkbootimg_path),
+        "--kernel", str(zimage),
+        "--ramdisk", str(ramdisk),
+        "--dt", str(dtb),
+        "--base", p["base"],
+        "--kernel_offset", p["kernel_offset"],
+        "--ramdisk_offset", p["ramdisk_offset"],
+        "--tags_offset", p["tags_offset"],
+        "--pagesize", p["pagesize"],
+        "--cmdline", p["cmdline"],
+        "--output", str(output),
+    ]
+    result = await run(cmd, config.kernel_dir)
+    if result.exit_code == 0:
+        size = output.stat().st_size
+        result.stdout += f"\nboot.img created: {output} ({size} bytes, {size/1024/1024:.1f} MB)"
+    return result
 
 
 def read_build_log(lines: int = 100, errors_only: bool = False) -> str:
