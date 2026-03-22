@@ -1,0 +1,6 @@
+{
+  "kernel-build": {
+    "command": "ssh",
+    "args": ["kernel-build", "python3", "-m", "kernel_build_mcp"]
+  }
+}
