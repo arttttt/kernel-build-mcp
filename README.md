@@ -4,7 +4,7 @@ MCP server for remote Linux kernel cross-compilation.
 
 ## Setup
 
-### 1. Tailscale (networking)
+### 1. Install Tailscale
 
 Install on both Mac and Linux:
 
@@ -17,45 +17,51 @@ curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
 ```
 
-Note the Tailscale IP of the Linux machine (`tailscale ip -4`).
-
-### 2. SSH key
+Enable Tailscale SSH on the Linux machine:
 
 ```bash
-# On Mac (if you don't have a key yet)
-ssh-keygen -t ed25519
+sudo tailscale up --ssh
+```
 
-# Copy to Linux machine
-ssh-copy-id user@100.x.x.x
+Verify connectivity from Mac:
 
-# Add to ~/.ssh/config
-cat >> ~/.ssh/config << 'EOF'
+```bash
+# Check Tailscale IP
+tailscale ip -4   # on Linux machine
+
+# Test SSH (no keys needed — Tailscale handles auth)
+ssh user@100.x.x.x
+```
+
+Add to `~/.ssh/config` for convenience:
+
+```
 Host kernel-build
     HostName 100.x.x.x
     User <user>
-    IdentityFile ~/.ssh/id_ed25519
-EOF
 ```
 
-### 3. Deploy MCP server to Linux
+### 2. Deploy MCP server to Linux
 
 ```bash
 scp -r . kernel-build:~/kernel-build-mcp/
 ssh kernel-build "~/kernel-build-mcp/install.sh"
 ```
 
-### 4. Configure
+### 3. Configure
 
-Either edit config on Linux:
+Either edit config on Linux directly:
+
 ```bash
 ssh kernel-build "vi ~/.config/kernel-build-mcp/config.json"
 ```
 
 Or use the `set_config` tool from Claude Code after connecting.
 
-### 5. Connect from Claude Code
+### 4. Connect from Claude Code
 
 Copy `.mcp.json` to your kernel project:
+
 ```bash
 cp .mcp.json /path/to/SmokeR24.1-kernel/.mcp.json
 ```
