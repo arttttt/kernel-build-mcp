@@ -157,8 +157,11 @@ async def git_reset(config: Config, branch: str | None = None) -> RunResult:
     return await run(["git", "reset", "--hard", f"origin/{branch_name}"], cwd)
 
 
-async def build(config: Config, target: str = "zImage modules", on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
+async def build(config: Config, target: str = "zImage", on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
     """Full kernel build."""
+    # Append DTB target if building zImage
+    if target == "zImage" and config.dtb_name:
+        target = f"zImage {config.dtb_name}"
     cmd = make_cmd(config, target)
     if on_line:
         return await run_streaming(cmd, config.kernel_dir, on_line, log_path=BUILD_LOG)
