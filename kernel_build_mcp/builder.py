@@ -1,22 +1,26 @@
-"""Kernel build logic — subprocess execution, make commands, log parsing."""
+"""Kernel build logic — subprocess execution, make commands, process management."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
-import re
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Awaitable
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
 
-BUILD_LOG = "/tmp/kernel-build-mcp.log"
+BUILD_LOG_DIR = "/tmp"
+
+
+def build_log_path(profile: str) -> str:
+    """Return the log file path for a given profile."""
+    safe_name = profile.replace("/", "_").replace(" ", "_")
+    return f"{BUILD_LOG_DIR}/kernel-build-mcp-{safe_name}.log"
 
 
 @dataclass
@@ -28,7 +32,7 @@ class RunResult:
 
 
 async def run(cmd: list[str], cwd: str, log_path: str | None = None) -> RunResult:
-    """Run a subprocess, capture output."""
+    """Run a subprocess, capture output. Kills process group on cancellation."""
     expanded_cwd = str(Path(cwd).expanduser())
     logger.info("Running: %s in %s", " ".join(cmd), expanded_cwd)
 
@@ -38,10 +42,16 @@ async def run(cmd: list[str], cwd: str, log_path: str | None = None) -> RunResul
         cwd=expanded_cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
-    stdout_bytes, stderr_bytes = await proc.communicate()
-    duration = time.monotonic() - start
+    try:
+        stdout_bytes, stderr_bytes = await proc.communicate()
+    except asyncio.CancelledError:
+        _kill_process_group(proc)
+        await proc.wait()
+        raise
 
+    duration = time.monotonic() - start
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
 
@@ -56,59 +66,19 @@ async def run(cmd: list[str], cwd: str, log_path: str | None = None) -> RunResul
     )
 
 
-async def run_streaming(
-    cmd: list[str],
-    cwd: str,
-    on_line: Callable[[str], Awaitable[None]],
-    log_path: str | None = None,
-) -> RunResult:
-    """Run a subprocess, stream each line via callback, capture full output."""
-    expanded_cwd = str(Path(cwd).expanduser())
-    logger.info("Running (streaming): %s in %s", " ".join(cmd), expanded_cwd)
-
-    start = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=expanded_cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-
-    async def read_stream(stream: asyncio.StreamReader, lines: list[str], is_stderr: bool = False):
-        while True:
-            line_bytes = await stream.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
-            lines.append(line)
-            await on_line(line)
-
-    await asyncio.gather(
-        read_stream(proc.stdout, stdout_lines),
-        read_stream(proc.stderr, stderr_lines, is_stderr=True),
-    )
-    await proc.wait()
-    duration = time.monotonic() - start
-
-    stdout = "\n".join(stdout_lines)
-    stderr = "\n".join(stderr_lines)
-
-    if log_path:
-        Path(log_path).write_text(stdout + "\n" + stderr)
-
-    return RunResult(
-        exit_code=proc.returncode or 0,
-        stdout=stdout,
-        stderr=stderr,
-        duration_s=round(duration, 2),
-    )
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """Send SIGTERM to the entire process group."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        logger.info("Sent SIGTERM to process group %d", proc.pid)
+    except ProcessLookupError:
+        pass
+    except OSError as e:
+        logger.warning("Failed to kill process group %d: %s", proc.pid, e)
 
 
 def make_cmd(config: Config, target: str, extra_args: list[str] | None = None) -> list[str]:
-    """Build a make command from config. Single source of truth for make invocation."""
+    """Build a make command from config."""
     jobs = os.cpu_count() or 4
     cmd = [
         "make",
@@ -157,23 +127,18 @@ async def git_reset(config: Config, branch: str | None = None) -> RunResult:
     return await run(["git", "reset", "--hard", f"origin/{branch_name}"], cwd)
 
 
-async def build(config: Config, target: str = "zImage", on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
+async def build(config: Config, target: str = "zImage", profile: str = "") -> RunResult:
     """Full kernel build."""
-    # Append DTB target if building zImage
     if target == "zImage" and config.dtb_name:
         target = f"zImage {config.dtb_name}"
     cmd = make_cmd(config, target)
-    if on_line:
-        return await run_streaming(cmd, config.kernel_dir, on_line, log_path=BUILD_LOG)
-    return await run(cmd, config.kernel_dir, log_path=BUILD_LOG)
+    return await run(cmd, config.kernel_dir, log_path=build_log_path(profile))
 
 
-async def build_module(config: Config, path: str, on_line: Callable[[str], Awaitable[None]] | None = None) -> RunResult:
+async def build_module(config: Config, path: str, profile: str = "") -> RunResult:
     """Build a specific module directory."""
     cmd = make_cmd(config, "modules", extra_args=[f"M={path}"])
-    if on_line:
-        return await run_streaming(cmd, config.kernel_dir, on_line, log_path=BUILD_LOG)
-    return await run(cmd, config.kernel_dir, log_path=BUILD_LOG)
+    return await run(cmd, config.kernel_dir, log_path=build_log_path(profile))
 
 
 async def defconfig(config: Config, name: str | None = None) -> RunResult:
@@ -235,35 +200,16 @@ async def build_boot_img(config: Config) -> RunResult:
     return result
 
 
-def read_build_log(lines: int = 100, errors_only: bool = False) -> str:
-    """Read the last build log."""
-    log_path = Path(BUILD_LOG)
-    if not log_path.exists():
-        return "No build log found. Run a build first."
-
-    content = log_path.read_text()
-
-    if errors_only:
-        pattern = re.compile(r"(error|warning|undefined reference|fatal)", re.IGNORECASE)
-        filtered = [line for line in content.splitlines() if pattern.search(line)]
-        return "\n".join(filtered[-lines:]) if filtered else "No errors or warnings found."
-
-    all_lines = content.splitlines()
-    return "\n".join(all_lines[-lines:])
-
-
-def read_artifact(config: Config, path: str) -> dict:
-    """Read a build artifact as base64."""
-    full_path = Path(config.kernel_dir).expanduser() / path
-    if not full_path.exists():
-        return {"error": f"Artifact not found: {path}"}
-    if not full_path.is_file():
-        return {"error": f"Not a file: {path}"}
-
-    size = full_path.stat().st_size
-    data = base64.b64encode(full_path.read_bytes()).decode("ascii")
+def get_log_info(profile: str) -> dict:
+    """Return log file path and metadata (size, mtime). None values if log doesn't exist."""
+    path = build_log_path(profile)
+    p = Path(path)
+    if not p.exists():
+        return {"path": path, "exists": False}
+    stat = p.stat()
     return {
-        "path": str(full_path),
-        "size_bytes": size,
-        "base64": data,
+        "path": path,
+        "exists": True,
+        "size_bytes": stat.st_size,
+        "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
     }
