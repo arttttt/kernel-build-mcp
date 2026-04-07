@@ -1,4 +1,4 @@
-"""MCP server for remote kernel builds. Stateless, profile-based."""
+"""MCP server for remote kernel and Android builds. Stateless, profile-based."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from . import builder, config
+from . import android_builder, builder, config
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
@@ -73,7 +73,7 @@ def _format_result(result: builder.RunResult) -> str:
     return "\n".join(parts)
 
 
-def _profile_response(cfg: config.Config, name: str, status: str) -> str:
+def _profile_response(cfg: config.Config | config.AndroidConfig, name: str, status: str) -> str:
     """Format a profile config as JSON response with validation info."""
     result = asdict(cfg)
     result["name"] = name
@@ -340,6 +340,174 @@ async def get_build_log_path(profile: str) -> str:
     Example: get_build_log_path(profile="SmokeR24.1")
     """
     info = builder.get_log_info(profile)
+    return json.dumps(info, indent=2)
+
+
+# --- Android profile helpers ---
+
+
+def _require_android_profile(profile: str) -> config.AndroidConfig:
+    """Load and validate an android profile."""
+    cfg = config.load_android_profile(profile)
+    if not cfg.is_configured():
+        raise ValueError(
+            f"Android profile '{profile}' is not fully configured (missing source_dir or lunch_target). "
+            "Use android_set_config() to fix it."
+        )
+    return cfg
+
+
+# --- Android profile management tools ---
+
+
+@mcp.tool()
+async def list_android_profiles() -> str:
+    """List all available Android/LineageOS/CM build profiles.
+
+    Returns a JSON object with all android profiles. Each profile contains:
+    source_dir, lunch_target.
+
+    Example: list_android_profiles()
+    """
+    profiles = config.list_android_profiles()
+    if not profiles:
+        return "No android profiles configured. Use create_android_profile() to add one."
+    return json.dumps(profiles, indent=2)
+
+
+@mcp.tool()
+async def create_android_profile(
+    name: str,
+    source_dir: str,
+    lunch_target: str,
+) -> str:
+    """Create a new Android/LineageOS/CM build profile.
+
+    Args:
+        name: Unique profile name (e.g. "cm-11", "lineage-14.1")
+        source_dir: Absolute path to Android source tree on this machine
+        lunch_target: Lunch target (e.g. "cm_mocha-userdebug", "lineage_mocha-userdebug")
+
+    Example: create_android_profile(name="cm-11", source_dir="/home/user/android/cm-11", lunch_target="cm_mocha-userdebug")
+    """
+    data = {"source_dir": source_dir, "lunch_target": lunch_target}
+    cfg = config.create_android_profile(name, data)
+    return _profile_response(cfg, name, "created")
+
+
+@mcp.tool()
+async def delete_android_profile(name: str) -> str:
+    """Delete an Android build profile.
+
+    Args:
+        name: Profile name to delete. Use list_android_profiles() to see available profiles.
+
+    Example: delete_android_profile(name="cm-11")
+    """
+    config.delete_android_profile(name)
+    return f"Android profile '{name}' deleted."
+
+
+@mcp.tool()
+async def android_set_config(
+    profile: str,
+    source_dir: str | None = None,
+    lunch_target: str | None = None,
+) -> str:
+    """Update configuration of an existing Android profile. Only provided fields are changed.
+
+    Args:
+        profile: Android profile name. Required.
+        source_dir: Absolute path to Android source tree
+        lunch_target: Lunch target
+
+    Example: android_set_config(profile="cm-11", lunch_target="cm_mocha-userdebug")
+    """
+    changes = {"source_dir": source_dir, "lunch_target": lunch_target}
+    cfg = config.update_android_profile(profile, changes)
+    return _profile_response(cfg, profile, "updated")
+
+
+# --- Android build tools ---
+
+
+@mcp.tool()
+async def android_build(profile: str, target: str = "bacon") -> str:
+    """Run Android/LineageOS/CM build. Output is saved to a log file.
+
+    Runs: source build/envsetup.sh && lunch <lunch_target> && make -jN <target>.
+    Default target "bacon" produces a flashable zip (CM/LineageOS).
+
+    On success: returns summary with duration and log path.
+    On failure: returns exit code, error lines from the log, and log path.
+
+    Args:
+        profile: Android profile name. Required. Use list_android_profiles() to see available profiles.
+        target: Make target (default: "bacon" for flashable zip). Other useful targets:
+            bootimage — build boot.img only
+            systemimage — build system.img only
+            recoveryimage — build recovery.img only
+            otapackage — build OTA zip
+
+    Example: android_build(profile="cm-11", target="bacon")
+    """
+    cfg = _require_android_profile(profile)
+    log_path = android_builder.build_log_path(profile)
+    result = await android_builder.build(cfg, target, profile=profile)
+    return _build_summary(result, log_path)
+
+
+@mcp.tool()
+async def android_clean(profile: str, full: bool = False) -> str:
+    """Clean Android build artifacts.
+
+    Args:
+        profile: Android profile name. Required.
+        full: If true, runs 'make clobber' (removes entire out/). Otherwise 'make clean'.
+
+    Example: android_clean(profile="cm-11", full=True)
+    """
+    cfg = _require_android_profile(profile)
+    result = await android_builder.clean(cfg, full)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def android_run_command(profile: str, command: str) -> str:
+    """Run a shell command in Android source dir with envsetup and lunch already sourced.
+
+    Use this to build individual components, run repo sync, or any other
+    command that needs the Android build environment.
+
+    Common build commands:
+    - "mka bootimage" — build boot.img only
+    - "mka systemimage" — build system.img only
+    - "mka recoveryimage" — build recovery.img only
+    - "mmm packages/apps/Settings" — build a single module by path
+    - "mm" — build module in current directory
+    - "repo sync" — sync source tree (does not need envsetup, but works)
+
+    Args:
+        profile: Android profile name. Required.
+        command: Shell command to execute (runs after 'source build/envsetup.sh && lunch <target>')
+
+    Example: android_run_command(profile="cm-11", command="mka bootimage")
+    """
+    cfg = _require_android_profile(profile)
+    result = await android_builder.run_command(cfg, command)
+    return _format_result(result)
+
+
+@mcp.tool()
+async def android_get_build_log_path(profile: str) -> str:
+    """Check if an Android build log exists and return its path and metadata.
+
+    Args:
+        profile: Android profile name. Required.
+
+    Example: android_get_build_log_path(profile="cm-11")
+    """
+    info = android_builder.get_log_info(profile)
     return json.dumps(info, indent=2)
 
 
