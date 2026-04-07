@@ -73,6 +73,18 @@ def _dict_to_config(data: dict) -> Config:
     return cfg
 
 
+def _get_profile(store: dict, name: str) -> dict:
+    """Get a profile dict by name or raise ValueError with available profiles."""
+    profiles = store.get("profiles", {})
+    if name not in profiles:
+        available = ", ".join(profiles.keys()) if profiles else "none"
+        raise ValueError(
+            f"Profile '{name}' not found. Available profiles: {available}. "
+            "Use list_profiles() to see all profiles."
+        )
+    return profiles[name]
+
+
 def list_profiles() -> dict[str, dict]:
     """Return all profiles as {name: config_dict}."""
     store = _read_store()
@@ -82,14 +94,7 @@ def list_profiles() -> dict[str, dict]:
 def load_profile(name: str) -> Config:
     """Load a specific profile by name. Raises ValueError if not found."""
     store = _read_store()
-    profiles = store.get("profiles", {})
-    if name not in profiles:
-        available = ", ".join(profiles.keys()) if profiles else "none"
-        raise ValueError(
-            f"Profile '{name}' not found. Available profiles: {available}. "
-            "Use list_profiles() to see all profiles."
-        )
-    return _dict_to_config(profiles[name])
+    return _dict_to_config(_get_profile(store, name))
 
 
 def create_profile(name: str, data: dict) -> Config:
@@ -107,29 +112,18 @@ def create_profile(name: str, data: dict) -> Config:
 def update_profile(name: str, changes: dict) -> Config:
     """Update fields of an existing profile. Only non-None values are applied."""
     store = _read_store()
-    profiles = store.get("profiles", {})
-    if name not in profiles:
-        available = ", ".join(profiles.keys()) if profiles else "none"
-        raise ValueError(
-            f"Profile '{name}' not found. Available profiles: {available}. "
-            "Use list_profiles() to see all profiles."
-        )
+    profile_data = _get_profile(store, name)
     known = {f.name for f in fields(Config)}
     for key, value in changes.items():
         if key in known and value is not None:
-            profiles[name][key] = value
+            profile_data[key] = value
     _write_store(store)
-    return _dict_to_config(profiles[name])
+    return _dict_to_config(profile_data)
 
 
 def delete_profile(name: str) -> None:
     """Delete a profile by name. Raises ValueError if not found."""
     store = _read_store()
-    profiles = store.get("profiles", {})
-    if name not in profiles:
-        available = ", ".join(profiles.keys()) if profiles else "none"
-        raise ValueError(
-            f"Profile '{name}' not found. Available profiles: {available}."
-        )
-    del profiles[name]
+    _get_profile(store, name)  # validate exists
+    del store["profiles"][name]
     _write_store(store)

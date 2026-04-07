@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from dataclasses import asdict
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -50,7 +51,6 @@ def _build_summary(result: builder.RunResult, log_path: str) -> str:
 
 def _extract_errors_from_log(log_path: str) -> str:
     """Extract error/warning lines from a build log file."""
-    from pathlib import Path
     p = Path(log_path)
     if not p.exists():
         return ""
@@ -71,6 +71,17 @@ def _format_result(result: builder.RunResult) -> str:
         parts.append(f"--- stderr ---\n{result.stderr}")
     parts.append(f"\n[exit_code={result.exit_code}, duration={result.duration_s}s]")
     return "\n".join(parts)
+
+
+def _profile_response(cfg: config.Config, name: str, status: str) -> str:
+    """Format a profile config as JSON response with validation info."""
+    result = asdict(cfg)
+    result["name"] = name
+    result["status"] = status
+    errors = cfg.validate()
+    if errors:
+        result["validation_errors"] = errors
+    return json.dumps(result, indent=2)
 
 
 # --- Profile management tools ---
@@ -123,14 +134,7 @@ async def create_profile(
         "ramdisk": ramdisk,
     }
     cfg = config.create_profile(name, data)
-    result = asdict(cfg)
-    result["name"] = name
-    errors = cfg.validate()
-    if errors:
-        result["validation_errors"] = errors
-    else:
-        result["status"] = "created"
-    return json.dumps(result, indent=2)
+    return _profile_response(cfg, name, "created")
 
 
 @mcp.tool()
@@ -178,13 +182,7 @@ async def set_config(
         "ramdisk": ramdisk,
     }
     cfg = config.update_profile(profile, changes)
-    result = asdict(cfg)
-    errors = cfg.validate()
-    if errors:
-        result["validation_errors"] = errors
-    else:
-        result["status"] = "updated"
-    return json.dumps(result, indent=2)
+    return _profile_response(cfg, profile, "updated")
 
 
 # --- Git tools ---

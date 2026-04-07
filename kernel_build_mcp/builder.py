@@ -129,8 +129,8 @@ async def git_reset(config: Config, branch: str | None = None) -> RunResult:
 
 async def build(config: Config, target: str = "zImage", profile: str = "") -> RunResult:
     """Full kernel build."""
-    if target == "zImage" and config.dtb_name:
-        target = f"zImage {config.dtb_name}"
+    if "zImage" in target.split() and config.dtb_name and config.dtb_name not in target:
+        target = f"{target} {config.dtb_name}"
     cmd = make_cmd(config, target)
     return await run(cmd, config.kernel_dir, log_path=build_log_path(profile))
 
